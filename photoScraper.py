@@ -1,15 +1,18 @@
 import argparse
+import getpass as getpass_module
+import io
 import os
+import re
 import sys
+import tempfile
 import time
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from getpass import getpass
-from datetime import datetime
-from datetime import timezone
 from pyicloud import PyiCloudService
+from pyicloud.exceptions import PyiCloudServiceUnavailable, PyiCloudAPIResponseException
 from PIL import Image
 from PIL.ExifTags import TAGS
 
@@ -26,9 +29,21 @@ class ExportState:
                     asset_id TEXT PRIMARY KEY,
                     path TEXT NOT NULL,
                     size INTEGER,
-                    mtime REAL
+                    mtime REAL,
+                    processed_at REAL DEFAULT (julianday('now'))
                 )
             """)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            # Add processed_at column if it doesn't exist (for existing databases)
+            try:
+                con.execute("ALTER TABLE processed ADD COLUMN processed_at REAL DEFAULT (julianday('now'))")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         # Build an in-memory cache of processed IDs for fast membership checks
         self._processed_ids: set[str] = set()
         with self._conn() as con:
@@ -51,6 +66,83 @@ class ExportState:
     def is_done(self, asset_id: str) -> bool:
         # Fast path using in-memory cache
         return asset_id in self._processed_ids
+
+    def get_last_processed_id(self) -> str | None:
+        """
+        Get the asset_id of the most recently processed asset.
+        Returns None if no assets have been processed yet.
+        Uses processed_at if available, otherwise falls back to rowid or mtime.
+        """
+        with self._conn() as con:
+            # First try: use processed_at column (most accurate)
+            try:
+                cur = con.execute(
+                    "SELECT asset_id FROM processed WHERE processed_at IS NOT NULL ORDER BY processed_at DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+            except sqlite3.OperationalError:
+                pass  # Column might not exist yet
+            
+            # Fallback 1: use rowid (insertion order, works for existing databases)
+            try:
+                cur = con.execute(
+                    "SELECT asset_id FROM processed ORDER BY rowid DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
+            
+            # Fallback 2: use mtime (file modification time, approximate)
+            try:
+                cur = con.execute(
+                    "SELECT asset_id FROM processed WHERE mtime IS NOT NULL ORDER BY mtime DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
+            
+            # Final fallback: just get any asset_id (better than nothing)
+            try:
+                cur = con.execute("SELECT asset_id FROM processed LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+            except Exception:
+                pass
+            
+            return None
+    
+    def has_processed_assets(self) -> bool:
+        """
+        Check if we have any processed assets at all.
+        """
+        return len(self._processed_ids) > 0
+
+    def is_backfill_complete(self) -> bool:
+        """
+        True once a prior run has made it all the way through the iCloud
+        library at least once without being cut short (by --max or an
+        interruption). Only then is it safe to stop scanning as soon as we
+        hit the first already-processed asset — otherwise an interrupted
+        initial backfill could look "caught up" while most of the library
+        is still undownloaded.
+        """
+        with self._conn() as con:
+            cur = con.execute("SELECT value FROM meta WHERE key = 'backfill_complete'")
+            row = cur.fetchone()
+            return row is not None and row[0] == "1"
+
+    def mark_backfill_complete(self):
+        with self._conn() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('backfill_complete', '1')"
+            )
 
     def mark_done(self, asset_id: str, path: Path):
         try:
@@ -79,7 +171,17 @@ def bootstrap_state_from_disk(api, out_root: Path, state: ExportState):
     by_filename = {}  # lowercased filename -> list[(asset_id, created_dt)]
     count_assets = 0
 
-    for asset in api.photos.all:
+    try:
+        photos_iter = api.photos.all
+    except PyiCloudServiceUnavailable as e:
+        log(f"❌ Photos service not available: {e}")
+        log("Cannot bootstrap state without access to photos.")
+        sys.exit(1)
+    except PyiCloudAPIResponseException as e:
+        log(f"❌ iCloud API error: {e}")
+        sys.exit(1)
+
+    for asset in photos_iter:
         count_assets += 1
         aid = getattr(asset, "id", None)
         fname = getattr(asset, "filename", None) or (f"{aid}.jpg" if aid else None)
@@ -313,6 +415,46 @@ def to_utc_naive(dt: datetime | None) -> datetime | None:
     except Exception:
         return dt.replace(tzinfo=None)
 
+
+def get_asset_at(photos, index: int):
+    """
+    Direct positional lookup into the photos album (photos[index]),
+    without walking the iterator. Returns None if the index is invalid
+    or the lookup fails for any reason.
+    """
+    try:
+        return photos[index]
+    except (IndexError, StopIteration, KeyError):
+        return None
+    except Exception as e:
+        log(f"Warning: failed to fetch photo at index {index}: {e}")
+        return None
+
+
+def detect_newest_end(photos, total: int) -> str | None:
+    """
+    Empirically determine which end of the album (index 0 or index
+    total-1) holds the newest photo, using two direct index lookups.
+
+    We can't just trust the album's declared sort direction: pyicloud's
+    "All Photos" iterator is configured "descending" but has been observed
+    to actually *yield* oldest-to-newest (its offset-stepping logic walks
+    the position array backwards). Direct indexing isn't necessarily
+    subject to that same iterator bug, so we verify directly instead of
+    assuming either way. Returns "start", "end", or None if inconclusive
+    (e.g. missing dates, or too few photos to tell).
+    """
+    if not total or total < 2:
+        return "start" if total else None
+    first = get_asset_at(photos, 0)
+    last = get_asset_at(photos, total - 1)
+    first_dt = to_utc_naive(getattr(first, "created", None)) if first else None
+    last_dt = to_utc_naive(getattr(last, "created", None)) if last else None
+    if not first_dt or not last_dt or first_dt == last_dt:
+        return None
+    return "start" if first_dt > last_dt else "end"
+
+
 def choose_dates(asset, downloaded_path: Path) -> datetime:
     """
     Decide the date to sort on.
@@ -337,14 +479,80 @@ def choose_dates(asset, downloaded_path: Path) -> datetime:
         return datetime.now()
 
 
+def clear_pyicloud_session_cache(account_name: str):
+    """
+    Remove pyicloud's cached session/cookiejar files for this account.
+
+    pyicloud reuses a cached session_token across runs so you don't have to
+    re-auth every time. If a stale/failed 2FA attempt leaves that cache
+    behind, the next run will "validate" the old token instead of doing a
+    fresh sign-in — which means Apple never sends a new push/popup, and you
+    get stuck waiting for a code that was never sent. Wiping the cache here
+    forces the next run to do a full fresh login.
+    """
+    topdir = Path(tempfile.gettempdir()) / "pyicloud"
+    cookie_dir = topdir / getpass_module.getuser()
+    safe_name = "".join(c for c in account_name if re.match(r"\w", c))
+    for suffix in (".session", ".cookiejar"):
+        f = cookie_dir / f"{safe_name}{suffix}"
+        try:
+            f.unlink()
+            log(f"Cleared stale session cache: {f}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f"Warning: Could not clear session cache {f}: {e}")
+
+
+def request_code_via_trusted_device(api: PyiCloudService):
+    """
+    Explicitly ask Apple to send a verification code to a chosen trusted
+    device/phone number, instead of waiting for the automatic push. Apple's
+    automatic 2FA push only reaches a device that's already signed into
+    iCloud with this Apple ID and online right now — if none is available
+    (or the account really only has a trusted phone number), no push ever
+    arrives and there's no other way to get a code short of this explicit
+    request.
+
+    Returns (device, code); device/code are None/"" if the request failed
+    or was aborted.
+    """
+    try:
+        devices = api.trusted_devices
+    except Exception as e:
+        log(f"Could not retrieve trusted devices: {e}")
+        return None, ""
+    if not devices:
+        log("No trusted devices/phone numbers found on this account.")
+        return None, ""
+    for i, device in enumerate(devices):
+        log(f"[{i}] {device.get('deviceName', 'Device')} - {device.get('phoneNumber', '')}")
+    try:
+        choice = int(input("Choose a device to send a code to: ").strip())
+        device = devices[choice]
+    except (ValueError, IndexError):
+        log("Invalid selection.")
+        return None, ""
+    if not api.send_verification_code(device):
+        log("❌ Failed to send verification code.")
+        return None, ""
+    return device, input("Enter the code you received: ").strip()
+
+
 def ensure_session(api: PyiCloudService):
     """
     Handle 2FA or 2SA if required.
     """
     if getattr(api, "requires_2fa", False):
         log("Two-factor authentication required.")
-        code = input("Enter the code you received: ").strip()
-        if not api.validate_2fa_code(code):
+        code = input(
+            "Enter the code you received, or press Enter if nothing arrived "
+            "to explicitly request one be sent to a trusted device/phone number: "
+        ).strip()
+        if not code:
+            _, code = request_code_via_trusted_device(api)
+        if not code or not api.validate_2fa_code(code):
+            clear_pyicloud_session_cache(api.account_name)
             sys.exit("❌ 2FA validation failed.")
         if not api.is_trusted_session:
             try:
@@ -354,15 +562,9 @@ def ensure_session(api: PyiCloudService):
                 log("Warning: Could not establish a trusted session.")
     elif getattr(api, "requires_2sa", False):  # older accounts
         log("Two-step authentication required.")
-        devices = api.trusted_devices
-        for i, device in enumerate(devices):
-            log(f"[{i}] {device.get('deviceName', 'Device')} - {device.get('phoneNumber','')}")
-        choice = int(input("Choose a device for a verification code: "))
-        device = devices[choice]
-        if not api.send_verification_code(device):
-            sys.exit("❌ Failed to send verification code.")
-        code = input("Enter the code you received: ").strip()
-        if not api.validate_verification_code(device, code):
+        device, code = request_code_via_trusted_device(api)
+        if not device or not code or not api.validate_verification_code(device, code):
+            clear_pyicloud_session_cache(api.account_name)
             sys.exit("❌ 2SA validation failed.")
         try:
             api.trust_session()
@@ -396,13 +598,16 @@ def save_times(path: Path, dt: datetime):
         pass
 
 
-def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3, throttle_s: float = 0.2, state: ExportState | None = None, quiet_skips: bool = False):
+def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3, throttle_s: float = 0.2, state: ExportState | None = None, quiet_skips: bool = False, skip_manifest_check: bool = False):
     """
     Check state for file before downloading
     Download one asset and place it in /YYYY/MM Month/filename, preserving times.
     Skips if file already exists.
+    
+    Args:
+        skip_manifest_check: If True, skip checking the manifest (assumes asset is unprocessed)
     """
-    if state and state.is_done(asset.id):
+    if state and not skip_manifest_check and state.is_done(asset.id):
         if not quiet_skips:
             print(f"Skipped (manifest): {getattr(asset, 'filename', asset.id)}")
         return
@@ -434,9 +639,10 @@ def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3
                 return
 
             log(f"Downloading: {safe_name}")
-            resp = asset.download()  # pyicloud provides .raw for streaming
-            with resp.raw as stream:
-                atomic_write(temp_path, stream)
+            data = asset.download()  # pyicloud 2.6.5+ returns raw bytes, not a streaming Response
+            if data is None:
+                raise RuntimeError("Download returned no data")
+            atomic_write(temp_path, io.BytesIO(data))
 
             # Decide the final date (EXIF if present)
             chosen_dt = choose_dates(asset, temp_path)
@@ -490,6 +696,7 @@ def main():
     parser.add_argument("--state", default=None, help="Path to resume DB (e.g. D:/iCloud/.state/icloud.sqlite). If omitted, one is created under --output.")
     parser.add_argument("--bootstrap-state", action="store_true", help="Scan --output and populate the state DB from existing files (one-time).")
     parser.add_argument("--quiet-skips", action="store_true", help="Don’t log per-asset skip messages for already-processed items")
+    parser.add_argument("--force-full-scan", action="store_true", help="Ignore the backfill-complete marker and do a full resume scan (safety net / re-verification).")
     args = parser.parse_args()
 
     username = args.username or input("iCloud Email: ").strip()
@@ -497,25 +704,38 @@ def main():
 
     out_root = Path(args.output).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-    out_root = Path(args.output).expanduser().resolve()
     state_path = Path(args.state) if args.state else (out_root / ".state" / "icloud.sqlite")
     state = ExportState(state_path)
-    out_root = Path(args.output).expanduser().resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    api = PyiCloudService(username, password)
-    ensure_session(api)
-
-    if args.bootstrap_state:
-        bootstrap_state_from_disk(api, out_root, state)
-        sys.exit(0)
 
     log("Authenticating to iCloud…")
     api = PyiCloudService(username, password)
     ensure_session(api)
 
-    # Photos handle can be large; iterate lazily
-    photos = api.photos.all
+    # Check if we still need 2FA/2SA (sometimes it's required after initial auth)
+    if getattr(api, "requires_2fa", False) or getattr(api, "requires_2sa", False):
+        log("⚠ Additional authentication required. Please complete 2FA/2SA.")
+        ensure_session(api)
+
+    # Verify photos service is available
+    log("Checking Photos service availability…")
+    try:
+        photos = api.photos.all
+    except PyiCloudServiceUnavailable as e:
+        log("❌ Photos service is not available.")
+        log("This usually means:")
+        log("  1. Your account doesn't have iCloud Photos enabled")
+        log("  2. Authentication failed or session expired")
+        log("  3. iCloud service is temporarily unavailable")
+        log(f"   Error details: {e}")
+        sys.exit(1)
+    except PyiCloudAPIResponseException as e:
+        log(f"❌ iCloud API error: {e}")
+        log("This usually means authentication failed. Please check your credentials.")
+        sys.exit(1)
+
+    if args.bootstrap_state:
+        bootstrap_state_from_disk(api, out_root, state)
+        sys.exit(0)
     try:
         total = len(photos)  # may be slow; safe to keep for user feedback
     except Exception:
@@ -526,13 +746,110 @@ def main():
     else:
         log("Enumerating photos…")
 
-    count = 0
-    for asset in photos:
-        export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips)
-        count += 1
-        if args.max and count >= args.max:
-            break
+    has_previous_runs = state.has_processed_assets()
+    fast_catchup = state.is_backfill_complete() and not args.force_full_scan
+    newest_end = None
+    if fast_catchup:
+        newest_end = detect_newest_end(photos, total) if total else None
+        if newest_end is None:
+            log("Could not verify which end of your library is newest — falling back to a full resume scan this run.")
+            fast_catchup = False
 
+    reached_end = False
+    count = 0
+    skipped_count = 0
+
+    if fast_catchup:
+        # A prior run already made it all the way through the library once, so the
+        # entire thing is a contiguous "done" block anchored at the newest photo.
+        # New photos can only appear beyond that block, so the moment we hit an
+        # already-processed asset (walking from the verified-newest end) we know
+        # everything past it is already handled too. We walk by direct index
+        # rather than the natural iterator, since that iterator has been observed
+        # to walk oldest-to-newest regardless of the album's declared direction.
+        idx = 0 if newest_end == "start" else total - 1
+        step = 1 if newest_end == "start" else -1
+        asset = get_asset_at(photos, idx)
+        if asset is not None:
+            first_name = getattr(asset, "filename", None) or getattr(asset, "id", "?")
+            first_dt = getattr(asset, "created", None)
+            log(f"Backfill previously completed — scanning newest-first from index {idx}. First item: {first_name} (created {first_dt}).")
+        else:
+            log(f"Backfill previously completed — scanning newest-first from index {idx}, but couldn't fetch it.")
+        while asset is not None and 0 <= idx < total:
+            asset_id = getattr(asset, "id", None)
+            if state.is_done(asset_id):
+                log(f"Caught up to already-processed photos after {count} new asset(s). Stopping scan.")
+                break
+            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=True)
+            count += 1
+            if args.max and count >= args.max:
+                break
+            idx += step
+            asset = get_asset_at(photos, idx) if 0 <= idx < total else None
+    else:
+        # Get the last processed asset ID to skip to that point
+        last_processed_id = state.get_last_processed_id()
+
+        if last_processed_id:
+            log(f"Resuming from last processed asset: {last_processed_id}")
+            log("Processing new photos until we reach the last processed asset...")
+        elif has_previous_runs:
+            # We have processed assets but couldn't determine the last one
+            # This can happen with old databases or migration issues
+            log("Found existing processed assets but couldn't determine last processed asset.")
+            log("Will process all photos (already-processed ones will be skipped efficiently).")
+            last_processed_id = None  # Ensure it's None so we don't try to skip
+        else:
+            log("No previous processing found. Starting from the beginning.")
+
+        found_last_processed = False
+        photos_before_last = 0
+        max_search_before_warning = 50000  # Safety: warn if we process many photos without finding last processed
+
+        for asset in photos:
+            asset_id = getattr(asset, "id", None)
+
+            # Determine if we should skip manifest check
+            # After finding last processed, we know everything after it is unprocessed
+            skip_manifest = found_last_processed
+
+            # If we have a last processed ID, process photos until we find it
+            # (these are new photos added since last run)
+            if last_processed_id and not found_last_processed:
+                if asset_id == last_processed_id:
+                    found_last_processed = True
+                    log(f"Found last processed asset after {photos_before_last} photos. Skipping it and continuing with older photos...")
+                    log("Skipping manifest checks for older photos (we know they're unprocessed)...")
+                    # Skip this one since we already processed it
+                    skipped_count += 1
+                    continue
+                else:
+                    # This is a new photo (appears before last processed in the list)
+                    # We need to check manifest for these since they might have been added in a previous interrupted run
+                    photos_before_last += 1
+                    if photos_before_last > 0 and photos_before_last % max_search_before_warning == 0:
+                        log(f"Warning: Processed {photos_before_last} photos without finding last processed asset.")
+                        log("It may have been deleted from iCloud. Continuing to process all photos...")
+                    # Check manifest for new photos (before last processed)
+                    skip_manifest = False
+
+            # Process this asset
+            # For photos after last processed: skip_manifest=True (we know they're unprocessed)
+            # For photos before last processed: skip_manifest=False (need to check manifest)
+            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=skip_manifest)
+            count += 1
+            if args.max and count >= args.max:
+                break
+        else:
+            reached_end = True
+
+    if reached_end and not args.dry_run and not state.is_backfill_complete():
+        state.mark_backfill_complete()
+        log("Reached the end of your iCloud library — future runs will use the fast catch-up scan.")
+
+    if skipped_count > 0:
+        log(f"Skipped {skipped_count} already-processed asset(s).")
     log(f"Done. Processed {count} asset(s).")
 
 
