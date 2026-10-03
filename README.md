@@ -11,6 +11,8 @@ Export your entire iCloud Photos library to a local drive with a clean year/mont
 - **Atomic writes**: Downloads to a temp file and renames into place to avoid partial files.
 - **Dry-run mode**: Preview exactly where files would land without downloading.
 - **Throttle and retry**: Tune network behavior and handle transient errors.
+- **Shared Albums**: Download a specific iCloud Shared Album (or regular album) into its own subfolder with its own resume state, instead of your whole library.
+- **Duplicate filename handling**: Optionally save same-named assets from different contributors (common in Shared Albums) under disambiguated names instead of skipping them.
 
 ### Requirements
 - **Python**: 3.9+ recommended
@@ -46,6 +48,12 @@ You’ll be prompted for your Apple ID and password if not provided via flags. T
 - `--retries` Retry attempts per asset (default `3`).
 - `--state` Path to the resume database. Defaults to `<output>/.state/icloud.sqlite`.
 - `--bootstrap-state` Scan `--output` and populate the state DB from existing files (no downloads), then exit.
+- `--quiet-skips` Don't log a line for every already-processed asset that's skipped.
+- `--force-full-scan` Ignore the backfill-complete marker and do a full resume scan instead of the fast catch-up path.
+- `--album` Name of a specific Shared Album (checked first) or regular album to download, instead of your full library. Saved under `<output>/<album name>/` with its own resume state.
+- `--list-albums` List your Shared Albums and regular albums (with their exact names), then exit.
+- `--accept-terms` Accept Apple's updated iCloud Terms of Service if you're prompted for them during login.
+- `--allow-duplicate-names` If two different assets share the same filename (common in Shared Albums with multiple contributors), save both under disambiguated names instead of skipping the second one.
 
 #### Examples
 - Basic export to an external drive:
@@ -72,6 +80,24 @@ python photoScraper.py -o D:/iCloud --state D:/iCloud/.state/icloud.sqlite
 python photoScraper.py -o D:/iCloud --bootstrap-state
 ```
 
+- List available Shared Albums and regular albums:
+
+```bash
+python photoScraper.py -o D:/iCloud --list-albums
+```
+
+- Download a specific Shared Album into its own subfolder (`D:/iCloud/Classics/`):
+
+```bash
+python photoScraper.py -o D:/iCloud --album "Classics"
+```
+
+- Same, but also keep same-named assets from different contributors instead of skipping them:
+
+```bash
+python photoScraper.py -o D:/iCloud --album "Classics" --allow-duplicate-names
+```
+
 ### Output layout
 Files are organized by year and month, for example:
 
@@ -89,6 +115,21 @@ D:/iCloud/
 ```
 
 Live Photos will have their video companion renamed to sit next to the still as `<still_name>_LIVE<ext>`.
+
+### Shared Albums
+Use `--album NAME` to download a single Shared Album (or regular album) instead of your whole library:
+
+```bash
+python photoScraper.py -o D:/iCloud --list-albums
+python photoScraper.py -o D:/iCloud --album "Family Trip 2024"
+```
+
+- `--list-albums` prints your Shared Albums and regular albums so you can find the exact name.
+- `--album` checks Shared Albums first, then falls back to a regular album with that name.
+- Output goes to its own subfolder, `<output>/<album name>/`, with its own `.state` resume database — separate from your main library export.
+- `--bootstrap-state` combined with `--album` scopes the scan to just that album.
+- Shared Albums often have several contributors uploading from different devices, which can produce filename collisions between genuinely different photos. By default the second one is skipped (see below); pass `--allow-duplicate-names` to keep both.
+- Note: this only covers the classic "Shared Albums" feature. Apple's newer iCloud Shared Photo Library isn't supported by the underlying `pyicloud` library yet.
 
 ### Resuming and bootstrapping
 - The tool records processed assets in a SQLite DB (the “state”) so repeated runs skip already-downloaded items.
@@ -116,10 +157,12 @@ python test_pairing.py
 ```
 
 ### Notes and troubleshooting
-- The script does not delete or overwrite existing files; existing paths are skipped.
+- The script does not delete or overwrite existing files; a filename collision at the computed destination is skipped by default (or disambiguated if `--allow-duplicate-names` is set).
 - If you see frequent failures, increase `--throttle` and/or `--retries`.
 - If `len(photos)` is slow or unavailable, the script will stream assets lazily regardless.
 - For security, avoid passing `--password` on shared machines; use the prompt instead.
+- If login fails with `PyiCloudAcceptTermsException`, Apple needs you to accept updated iCloud Terms of Service; rerun with `--accept-terms` once you're ready to accept them.
+- With `--allow-duplicate-names`, a disambiguated still (e.g. `IMG_1234_ab12cd34.HEIC`) won't be matched up with a same-named Live Photo video companion, since pairing is done by filename stem.
 
 ### Disclaimer
 This project relies on third-party libraries and iCloud’s private API surface. Use at your own risk and ensure you comply with Apple’s terms for your account and data.

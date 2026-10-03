@@ -158,11 +158,16 @@ class ExportState:
         # Keep cache in sync
         self._processed_ids.add(asset_id)
 
-def bootstrap_state_from_disk(api, out_root: Path, state: ExportState):
+def bootstrap_state_from_disk(api, out_root: Path, state: ExportState, photos_iter=None):
     """
     Populate the state DB by matching existing files on disk to iCloud assets.
     - Matches by asset ID (old naming) OR filename (with _LIVE normalization).
     - If multiple assets share the same filename, disambiguates by date proximity.
+
+    Args:
+        photos_iter: Album/library to index against. Defaults to the full
+            "All Photos" library; pass a specific album (e.g. a Shared Album)
+            to scope bootstrapping to just that album's assets.
     """
     print(f"Bootstrapping state from {out_root} …")
 
@@ -172,7 +177,8 @@ def bootstrap_state_from_disk(api, out_root: Path, state: ExportState):
     count_assets = 0
 
     try:
-        photos_iter = api.photos.all
+        if photos_iter is None:
+            photos_iter = api.photos.all
     except PyiCloudServiceUnavailable as e:
         log(f"❌ Photos service not available: {e}")
         log("Cannot bootstrap state without access to photos.")
@@ -479,6 +485,68 @@ def choose_dates(asset, downloaded_path: Path) -> datetime:
         return datetime.now()
 
 
+def sanitize_dirname(name: str) -> str:
+    """
+    Turn an album name into a filesystem-safe directory name (Windows-illegal
+    characters replaced with underscores).
+    """
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(".")
+    return cleaned or "album"
+
+
+def find_album(api, name: str):
+    """
+    Look up an album by (case-insensitive) name. Checks Shared Albums first
+    since that's the common case for "download from a shared folder", then
+    falls back to regular albums in the user's own library.
+
+    Returns (album, kind) where kind is "shared album" or "album", or
+    (None, None) if no match was found.
+    """
+    name_lower = name.strip().lower()
+    try:
+        for album in api.photos.shared_streams:
+            if album.name.strip().lower() == name_lower:
+                return album, "shared album"
+    except Exception as e:
+        log(f"Warning: could not list shared albums: {e}")
+    try:
+        for album in api.photos.albums:
+            if album.name.strip().lower() == name_lower:
+                return album, "album"
+    except Exception as e:
+        log(f"Warning: could not list albums: {e}")
+    return None, None
+
+
+def list_albums(api):
+    """
+    Print available Shared Albums and regular albums so the user can find
+    the exact name to pass to --album.
+    """
+    log("Shared Albums:")
+    try:
+        names = [album.name for album in api.photos.shared_streams]
+        if names:
+            for name in names:
+                log(f"  - {name}")
+        else:
+            log("  (none found)")
+    except Exception as e:
+        log(f"  (could not list shared albums: {e})")
+
+    log("Albums:")
+    try:
+        names = [album.name for album in api.photos.albums]
+        if names:
+            for name in names:
+                log(f"  - {name}")
+        else:
+            log("  (none found)")
+    except Exception as e:
+        log(f"  (could not list albums: {e})")
+
+
 def clear_pyicloud_session_cache(account_name: str):
     """
     Remove pyicloud's cached session/cookiejar files for this account.
@@ -598,14 +666,42 @@ def save_times(path: Path, dt: datetime):
         pass
 
 
-def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3, throttle_s: float = 0.2, state: ExportState | None = None, quiet_skips: bool = False, skip_manifest_check: bool = False):
+def make_unique_path(path: Path, asset_id: str) -> Path:
+    """
+    Disambiguate a filename collision by tagging it with a short deterministic
+    suffix derived from the asset id. Shared Albums commonly have multiple
+    contributors whose devices produce the same filename (e.g. IMG_1234.JPG)
+    for genuinely different photos, so an existing file at `path` doesn't
+    necessarily mean this asset was already downloaded.
+
+    Deterministic (not random/counter-based as the first attempt) so reruns
+    land on the same disambiguated name instead of piling up numbered
+    variants each time.
+    """
+    tag = re.sub(r"[^A-Za-z0-9]", "", asset_id)[-8:] or "dup"
+    candidate = path.with_name(f"{path.stem}_{tag}{path.suffix}")
+    if not candidate.exists():
+        return candidate
+    n = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{tag}_{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3, throttle_s: float = 0.2, state: ExportState | None = None, quiet_skips: bool = False, skip_manifest_check: bool = False, allow_duplicate_names: bool = False):
     """
     Check state for file before downloading
     Download one asset and place it in /YYYY/MM Month/filename, preserving times.
     Skips if file already exists.
-    
+
     Args:
         skip_manifest_check: If True, skip checking the manifest (assumes asset is unprocessed)
+        allow_duplicate_names: If True, a filename collision with an existing file is
+            treated as two distinct assets (common in Shared Albums with multiple
+            contributors) and the new one is saved under a disambiguated name instead
+            of being skipped.
     """
     if state and not skip_manifest_check and state.is_done(asset.id):
         if not quiet_skips:
@@ -654,9 +750,13 @@ def export_asset(api, asset, root: Path, dry_run: bool = False, retries: int = 3
             final_path = final_dir / safe_name
 
             if final_path.exists():
-                log(f"Skipped (exists): {final_path}")
-                temp_path.unlink(missing_ok=True)
-                return
+                if allow_duplicate_names:
+                    final_path = make_unique_path(final_path, asset.id)
+                    log(f"Duplicate filename — saving as: {final_path.name}")
+                else:
+                    log(f"Skipped (exists): {final_path}")
+                    temp_path.unlink(missing_ok=True)
+                    return
 
             # Move into place and set times
             temp_path.replace(final_path)
@@ -697,18 +797,17 @@ def main():
     parser.add_argument("--bootstrap-state", action="store_true", help="Scan --output and populate the state DB from existing files (one-time).")
     parser.add_argument("--quiet-skips", action="store_true", help="Don’t log per-asset skip messages for already-processed items")
     parser.add_argument("--force-full-scan", action="store_true", help="Ignore the backfill-complete marker and do a full resume scan (safety net / re-verification).")
+    parser.add_argument("--album", default=None, help="Name of a specific Shared Album (or regular album) to download instead of your full library. Saved into its own subfolder under --output.")
+    parser.add_argument("--list-albums", action="store_true", help="List available Shared Albums and regular albums, then exit.")
+    parser.add_argument("--accept-terms", action="store_true", help="Accept Apple's updated iCloud Terms of Service if prompted during login.")
+    parser.add_argument("--allow-duplicate-names", action="store_true", help="If two different assets share the same filename (common in Shared Albums with multiple contributors), save both under disambiguated names instead of skipping the second one.")
     args = parser.parse_args()
 
     username = args.username or input("iCloud Email: ").strip()
     password = args.password or getpass("Password (input hidden): ")
 
-    out_root = Path(args.output).expanduser().resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
-    state_path = Path(args.state) if args.state else (out_root / ".state" / "icloud.sqlite")
-    state = ExportState(state_path)
-
     log("Authenticating to iCloud…")
-    api = PyiCloudService(username, password)
+    api = PyiCloudService(username, password, accept_terms=args.accept_terms)
     ensure_session(api)
 
     # Check if we still need 2FA/2SA (sometimes it's required after initial auth)
@@ -733,8 +832,31 @@ def main():
         log("This usually means authentication failed. Please check your credentials.")
         sys.exit(1)
 
+    if args.list_albums:
+        list_albums(api)
+        sys.exit(0)
+
+    base_output = Path(args.output).expanduser().resolve()
+    album_scope = None
+    if args.album:
+        album, kind = find_album(api, args.album)
+        if album is None:
+            log(f"❌ No album named '{args.album}' found.")
+            list_albums(api)
+            sys.exit(1)
+        log(f"Using {kind} '{album.name}' as source.")
+        photos = album
+        album_scope = photos
+        out_root = base_output / sanitize_dirname(album.name)
+    else:
+        out_root = base_output
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    state_path = Path(args.state) if args.state else (out_root / ".state" / "icloud.sqlite")
+    state = ExportState(state_path)
+
     if args.bootstrap_state:
-        bootstrap_state_from_disk(api, out_root, state)
+        bootstrap_state_from_disk(api, out_root, state, photos_iter=album_scope)
         sys.exit(0)
     try:
         total = len(photos)  # may be slow; safe to keep for user feedback
@@ -781,7 +903,7 @@ def main():
             if state.is_done(asset_id):
                 log(f"Caught up to already-processed photos after {count} new asset(s). Stopping scan.")
                 break
-            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=True)
+            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=True, allow_duplicate_names=args.allow_duplicate_names)
             count += 1
             if args.max and count >= args.max:
                 break
@@ -837,7 +959,7 @@ def main():
             # Process this asset
             # For photos after last processed: skip_manifest=True (we know they're unprocessed)
             # For photos before last processed: skip_manifest=False (need to check manifest)
-            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=skip_manifest)
+            export_asset(api, asset, out_root, dry_run=args.dry_run, retries=args.retries, throttle_s=args.throttle, state=state, quiet_skips=args.quiet_skips, skip_manifest_check=skip_manifest, allow_duplicate_names=args.allow_duplicate_names)
             count += 1
             if args.max and count >= args.max:
                 break
